@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"os"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/go-piv/piv-go/piv"
@@ -60,6 +61,8 @@ func connectForSetup() *piv.YubiKey {
 
 func runReset(yk *piv.YubiKey) {
 	fmt.Println("Resetting YubiKey PIV applet...")
+	time.Sleep(15 * time.Second)
+	fmt.Println("Resetting YubiKey PIV applet... for real now...")
 	if err := yk.Reset(); err != nil {
 		log.Fatalln("Failed to reset YubiKey:", err)
 	}
@@ -136,58 +139,101 @@ func runSetup(yk *piv.YubiKey) {
 		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
 	}
 
-	pub, err := yk.GenerateKey(key, piv.SlotAuthentication, piv.Key{
-		Algorithm:   piv.AlgorithmEC256,
-		PINPolicy:   piv.PINPolicyOnce,
-		TouchPolicy: piv.TouchPolicyAlways,
-	})
+	serial, err := yk.Serial()
 	if err != nil {
-		log.Fatalln("Failed to generate key:", err)
+		log.Fatalln("Failed to determine YubiKey serial:", err)
 	}
 
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		log.Fatalln("Failed to generate parent key:", err)
+	type SlotConfig struct {
+		UseCase string
+		Key     piv.Key
 	}
-	parent := &x509.Certificate{
-		Subject: pkix.Name{
-			Organization:       []string{"yubikey-agent"},
-			OrganizationalUnit: []string{Version},
+	var setupSlots = map[piv.Slot]SlotConfig{
+		piv.SlotAuthentication: {
+			UseCase: "Touch Required",
+			Key: piv.Key{
+				Algorithm:   piv.AlgorithmEC256,
+				PINPolicy:   piv.PINPolicyOnce,
+				TouchPolicy: piv.TouchPolicyAlways,
+			},
 		},
-		PublicKey: priv.Public(),
-	}
-	template := &x509.Certificate{
-		Subject: pkix.Name{
-			CommonName: "SSH key",
+		piv.SlotSignature: {
+			UseCase: "Touch Not Required",
+			Key: piv.Key{
+				Algorithm:   piv.AlgorithmEC256,
+				PINPolicy:   piv.PINPolicyOnce,
+				TouchPolicy: piv.TouchPolicyNever,
+			},
 		},
-		NotAfter:     time.Now().AddDate(42, 0, 0),
-		NotBefore:    time.Now(),
-		SerialNumber: randomSerialNumber(),
-		KeyUsage:     x509.KeyUsageKeyAgreement | x509.KeyUsageDigitalSignature,
-	}
-	certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
-	if err != nil {
-		log.Fatalln("Failed to generate certificate:", err)
-	}
-	cert, err := x509.ParseCertificate(certBytes)
-	if err != nil {
-		log.Fatalln("Failed to parse certificate:", err)
-	}
-	if err := yk.SetCertificate(key, piv.SlotAuthentication, cert); err != nil {
-		log.Fatalln("Failed to store certificate:", err)
+		piv.SlotCardAuthentication: {
+			UseCase: "Touch Not Required",
+			Key: piv.Key{
+				Algorithm:   piv.AlgorithmRSA2048,
+				PINPolicy:   piv.PINPolicyOnce,
+				TouchPolicy: piv.TouchPolicyNever,
+			},
+		},
 	}
 
-	sshKey, err := ssh.NewPublicKey(pub)
-	if err != nil {
-		log.Fatalln("Failed to generate public key:", err)
+	var publicKeys []string
+
+	for slot, config := range setupSlots {
+		cn := fmt.Sprintf("YubiKey #%d PIV Slot %x (%s)", serial, slot.Key, config.UseCase)
+
+		pub, err := yk.GenerateKey(key, slot, config.Key)
+		if err != nil {
+			log.Fatalln("Failed to generate key:", err)
+		}
+
+		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			log.Fatalln("Failed to generate parent key:", err)
+		}
+		parent := &x509.Certificate{
+			Subject: pkix.Name{
+				Organization:       []string{"yubikey-agent"},
+				OrganizationalUnit: []string{Version},
+			},
+			PublicKey: priv.Public(),
+		}
+		template := &x509.Certificate{
+			Subject: pkix.Name{
+				CommonName: cn,
+			},
+			NotAfter:     time.Now().AddDate(42, 0, 0),
+			NotBefore:    time.Now(),
+			SerialNumber: randomSerialNumber(),
+			KeyUsage:     x509.KeyUsageKeyAgreement | x509.KeyUsageDigitalSignature,
+		}
+		certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
+		if err != nil {
+			log.Fatalln("Failed to generate certificate:", err)
+		}
+		cert, err := x509.ParseCertificate(certBytes)
+		if err != nil {
+			log.Fatalln("Failed to parse certificate:", err)
+		}
+		if err := yk.SetCertificate(key, slot, cert); err != nil {
+			log.Fatalln("Failed to store certificate:", err)
+		}
+
+		sshKey, err := ssh.NewPublicKey(pub)
+		if err != nil {
+			log.Fatalln("Failed to generate public key:", err)
+		}
+		keyLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshKey)))
+		publicKeys = append(publicKeys, fmt.Sprintf("%s %s\n", keyLine, cert.Subject.CommonName))
 	}
+
 
 	fmt.Println("")
 	fmt.Println("✅ Done! This YubiKey is secured and ready to go.")
 	fmt.Println("🤏 When the YubiKey blinks, touch it to authorize the login.")
 	fmt.Println("")
-	fmt.Println("🔑 Here's your new shiny SSH public key:")
-	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
+	fmt.Println("🔑 Here's your new shiny SSH public key(s):")
+	for _, key := range publicKeys {
+		_, _ = os.Stdout.Write([]byte(key))
+	}
 	fmt.Println("")
 	fmt.Println("Next steps: ensure yubikey-agent is running via launchd/systemd/...,")
 	fmt.Println(`set the SSH_AUTH_SOCK environment variable, and test with "ssh-add -L"`)
